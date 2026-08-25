@@ -1649,7 +1649,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         "Modem statistics (SNR, attenuation, rates) come from the modem's",
         "TR-064 management API on your LAN - they only exist on modems, so",
         "other connection types show an explanatory notice instead. Set the",
-        "address with F7 on the Modem tab (default fritz.box).",
+        "address with F7 on the Modem tab (default fritz.box). If the tab",
+        "reports 'panel is reachable but no TR-064 API', your modem does not",
+        "offer this standard and the values cannot be read by any generic tool.",
     ] {
         text.push(Line::from(Span::styled(
             format!(" {note}"),

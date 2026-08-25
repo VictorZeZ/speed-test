@@ -198,16 +198,27 @@ pub async fn run_modem_poller(
                 }
                 match result {
                     Some(s) => s,
-                    None => DslSnapshot {
-                        available: false,
-                        fetched_at: Some(Local::now()),
-                        unavailable_reason: Some(format!(
-                            "tried {} - {}",
-                            tried.join(", "),
-                            reasons.last().cloned().unwrap_or_else(|| "no answer".into())
-                        )),
-                        ..Default::default()
-                    },
+                    None => {
+                        // Surface the most actionable finding: if any host
+                        // had a reachable panel without TR-064, that tells
+                        // the user far more than a transport timeout.
+                        let best = reasons
+                            .iter()
+                            .find(|r| r.contains("panel is reachable"))
+                            .or_else(|| reasons.first())
+                            .cloned()
+                            .unwrap_or_else(|| "no answer".into());
+                        DslSnapshot {
+                            available: false,
+                            fetched_at: Some(Local::now()),
+                            unavailable_reason: Some(format!(
+                                "tried {} - {}",
+                                tried.join(", "),
+                                best
+                            )),
+                            ..Default::default()
+                        }
+                    }
                 }
             }
         };
@@ -349,10 +360,19 @@ async fn fetch_snapshot(client: &Client, cfg: &ModemConfig) -> DslSnapshot {
         }
         Err(e) => {
             snap.available = false;
-            snap.unavailable_reason = Some(format!(
-                "no TR-064 answer from {} ({})",
-                hostport,
+            // Distinguish "modem unreachable" from "reachable but this model
+            // has no TR-064 service" by probing its web panel directly.
+            let panel_reachable =
+                probe_panel(client, &format!("http://{hostport}")).await.is_ok();
+            let detail = if panel_reachable {
+                format!(
+                    "the web panel responds at http://{hostport}/ , but no TR-064 management API was found on port {port} - this model likely does not support it"
+                )
+            } else {
                 describe_transport_error(&e)
+            };
+            snap.unavailable_reason = Some(format!(
+                "no TR-064 answer from {hostport}: {detail}"
             ));
             return snap;
         }
@@ -536,6 +556,20 @@ fn md5_hex(input: &str) -> String {
 // ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
+
+/// Quick reachability check of the modem's web panel (any HTTP answer counts,
+/// including 401/403 - it proves the device is there).
+async fn probe_panel(client: &Client, base: &str) -> Result<(), ()> {
+    match client
+        .get(format!("{base}/"))
+        .timeout(Duration::from_millis(2500))
+        .send()
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(_) => Err(()),
+    }
+}
 
 fn xml_val(xml: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
