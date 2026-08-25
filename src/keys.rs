@@ -24,6 +24,7 @@ pub enum Action {
     TabPrev,
     TabTest,
     TabMonitor,
+    TabDsl,
     TabHistory,
     TabHelp,
 
@@ -37,6 +38,10 @@ pub enum Action {
     EditTarget,
     ResetSession,
 
+    DslPauseResume,
+    EditModem,
+    ClearModemLog,
+
     HistoryUp,
     HistoryDown,
     DeleteEntry,
@@ -48,6 +53,7 @@ pub enum Scope {
     Global,
     Test,
     Monitor,
+    Dsl,
     History,
 }
 
@@ -57,6 +63,7 @@ impl Scope {
             Scope::Global => "GENERAL",
             Scope::Test => "SPEED TEST",
             Scope::Monitor => "MONITOR",
+            Scope::Dsl => "MODEM",
             Scope::History => "HISTORY",
         }
     }
@@ -67,6 +74,7 @@ impl Scope {
             Scope::Global => Color::Yellow,
             Scope::Test => Color::Cyan,
             Scope::Monitor => Color::LightGreen,
+            Scope::Dsl => Color::LightBlue,
             Scope::History => Color::Green,
         }
     }
@@ -114,6 +122,8 @@ pub const KEYMAP: &[KeyDef] = &[
         (KeyCode::F(3), "F3")),
     def!(Action::TabHelp, Scope::Global, "open help tab",
         (KeyCode::F(4), "F4")),
+    def!(Action::TabDsl, Scope::Global, "open modem tab",
+        (KeyCode::F(9), "F9")),
 
     // ---- test tab ----
     def!(Action::StartStopTest, Scope::Test, "start test · stop continuous session",
@@ -133,6 +143,14 @@ pub const KEYMAP: &[KeyDef] = &[
     def!(Action::EditTarget, Scope::Monitor, "change target host",
         (KeyCode::F(7), "F7"), (KeyCode::Char('t'), "T")),
     def!(Action::ResetSession, Scope::Monitor, "reset session stats & events",
+        (KeyCode::F(8), "F8"), (KeyCode::Char('c'), "C")),
+
+    // ---- modem tab ----
+    def!(Action::DslPauseResume, Scope::Dsl, "pause / resume polling",
+        (KeyCode::Enter, "ENTER")),
+    def!(Action::EditModem, Scope::Dsl, "modem address & login",
+        (KeyCode::F(7), "F7"), (KeyCode::Char('t'), "T")),
+    def!(Action::ClearModemLog, Scope::Dsl, "clear modem log",
         (KeyCode::F(8), "F8"), (KeyCode::Char('c'), "C")),
 
     // ---- history tab ----
@@ -209,6 +227,7 @@ fn scope_of(tab: crate::app::Tab) -> Scope {
     match tab {
         crate::app::Tab::Test => Scope::Test,
         crate::app::Tab::Monitor => Scope::Monitor,
+        crate::app::Tab::Dsl => Scope::Dsl,
         crate::app::Tab::History => Scope::History,
         crate::app::Tab::Help => Scope::History, // help has no own bindings
     }

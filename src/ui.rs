@@ -42,6 +42,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.tab {
         crate::app::Tab::Test => draw_test(f, app, outer[2]),
         crate::app::Tab::Monitor => draw_monitor(f, app, outer[2]),
+        crate::app::Tab::Dsl => draw_dsl(f, app, outer[2]),
         crate::app::Tab::History => draw_history(f, app, outer[2]),
         crate::app::Tab::Help => draw_help(f, outer[2]),
     }
@@ -150,7 +151,7 @@ fn location_label(c: &ConnectionInfo) -> String {
 }
 
 fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let titles = vec![" Test ", " Monitor ", " History ", " Help "];
+    let titles = vec![" Test ", " Monitor ", " Modem ", " History ", " Help "];
     let idx = app.tab.index();
     let tabs = Tabs::new(titles)
         .select(idx)
@@ -173,6 +174,7 @@ fn draw_footer(f: &mut Frame, app: &mut App, area: Rect) {
     let scope = match app.tab {
         crate::app::Tab::Test => keys::Scope::Test,
         crate::app::Tab::Monitor => keys::Scope::Monitor,
+        crate::app::Tab::Dsl => keys::Scope::Dsl,
         crate::app::Tab::History | crate::app::Tab::Help => keys::Scope::History,
     };
 
@@ -1111,6 +1113,376 @@ fn draw_target_editor(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(input, Rect { x: inner.x, y: inner.y + 1, height: 1, ..inner });
 }
 
+// ---------- Modem (DSL) tab ----------
+
+fn snr_color(v: f64) -> Color {
+    if v < crate::dsl::SNR_CRIT_DB {
+        Color::Red
+    } else if v < crate::dsl::SNR_WARN_DB {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+fn att_color(v: f64) -> Color {
+    if v > crate::dsl::ATT_CRIT_DB {
+        Color::Red
+    } else if v > crate::dsl::ATT_WARN_DB {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+fn fmt_opt_db(v: Option<f64>) -> String {
+    match v {
+        Some(x) => format!("{:.1} dB", x),
+        None => "-".to_string(),
+    }
+}
+
+fn fmt_opt_mbps(v: Option<f64>) -> String {
+    match v {
+        Some(x) => format!("{:.2} Mbps", x),
+        None => "-".to_string(),
+    }
+}
+
+fn fmt_opt_dbm(v: Option<f64>) -> String {
+    match v {
+        Some(x) => format!("{:.1} dBm", x),
+        None => "-".to_string(),
+    }
+}
+
+fn fmt_uptime(secs: Option<u64>) -> String {
+    let Some(s) = secs else { return "-".to_string() };
+    let d = s / 86400;
+    let h = (s % 86400) / 3600;
+    let m = (s % 3600) / 60;
+    if d > 0 {
+        format!("{}d {}h {}m", d, h, m)
+    } else if h > 0 {
+        format!("{}h {}m", h, m)
+    } else {
+        format!("{}m {}s", m, s % 60)
+    }
+}
+
+fn draw_dsl(f: &mut Frame, app: &mut App, area: Rect) {
+    // The grid gets a fixed height (13 content rows + borders); the log takes
+    // the rest and scrolls internally.
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(15),
+        Constraint::Min(6),
+    ])
+    .split(area);
+
+    draw_dsl_banner(f, app, rows[0]);
+    draw_dsl_grid(f, app, rows[1]);
+    draw_modem_log(f, app, rows[2]);
+
+    if app.dsl.editing {
+        draw_modem_editor(f, app, area);
+    }
+}
+
+fn draw_dsl_banner(f: &mut Frame, app: &App, area: Rect) {
+    let line = match (&app.dsl.current, app.dsl.polling) {
+        (Some(snap), _) if snap.available => Line::from(vec![
+            Span::styled(
+                "LIVE ",
+                Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("modem polling · {} · every 2s", app.dsl.config.host),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("   [F7] edit modem", Style::default().fg(Color::DarkGray)),
+        ]),
+        (_, true) => Line::from(Span::styled(
+            "MODEM STATS REQUIRE A TR-064 CAPABLE MODEM/ROUTER ON YOUR LAN (e.g. FRITZ!BOX)",
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        )),
+        (_, false) => Line::from(Span::styled(
+            "[idle] modem polling stopped - press ENTER to resume",
+            Style::default().fg(Color::DarkGray),
+        )),
+    };
+
+    // Show the concrete reason when known (connection refused, timeout...).
+    let mut spans_vec: Vec<Span> = line.spans;
+    if let Some(reason) = app
+        .dsl
+        .current
+        .as_ref()
+        .and_then(|s| s.unavailable_reason.clone())
+    {
+        spans_vec.push(Span::styled(
+            format!("  ({})", truncate_str(&reason, 40)),
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        ));
+    }
+    f.render_widget(Line::from(spans_vec), area);
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{}…", cut)
+    }
+}
+
+/// One aligned grid row: label | downstream | upstream.
+fn dsl_row<'a>(
+    label: &str,
+    down: (String, Color),
+    up: (String, Color),
+) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(format!(" {:<18}", label), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{:<16}", down.0), Style::default().fg(down.1).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:<16}", up.0), Style::default().fg(up.1).add_modifier(Modifier::BOLD)),
+    ])
+}
+
+fn dsl_shared_row(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {:<18}", label), Style::default().fg(Color::DarkGray)),
+        Span::styled(value.to_string(), Style::default().fg(Color::Gray)),
+    ])
+}
+
+fn draw_dsl_grid(f: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            " LINE STATISTICS ",
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let Some(ref snap) = app.dsl.current else {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "waiting for the first modem response…",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    };
+
+    if !snap.available {
+        // Banner already explains; keep this panel empty.
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Header row.
+    lines.push(Line::from(vec![
+        Span::styled(format!(" {:<18}", "value"), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{:<16}", "DOWNSTREAM"),
+            Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{:<16}", "UPSTREAM"),
+            Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        " ----------------------------------------------",
+        Style::default().fg(Color::Rgb(60, 60, 90)),
+    )));
+
+    let dash = ("-".to_string(), Color::DarkGray);
+    lines.push(dsl_row(
+        "SNR margin",
+        snap.snr_down_db.map(|v| (fmt_opt_db(Some(v)), snr_color(v))).unwrap_or_else(|| dash.clone()),
+        snap.snr_up_db.map(|v| (fmt_opt_db(Some(v)), snr_color(v))).unwrap_or_else(|| dash.clone()),
+    ));
+    lines.push(dsl_row(
+        "Line attenuation",
+        snap.atten_down_db.map(|v| (fmt_opt_db(Some(v)), att_color(v))).unwrap_or_else(|| dash.clone()),
+        snap.atten_up_db.map(|v| (fmt_opt_db(Some(v)), att_color(v))).unwrap_or_else(|| dash.clone()),
+    ));
+
+    let rate_down_color = match (snap.rate_down_mbps, snap.max_rate_down_mbps) {
+        (Some(r), Some(m)) if m > 1.0 && r < m * 0.5 => Color::Red,
+        (Some(r), Some(m)) if m > 1.0 && r < m * 0.7 => Color::Yellow,
+        _ => Color::White,
+    };
+    let rate_up_color = match (snap.rate_up_mbps, snap.max_rate_up_mbps) {
+        (Some(r), Some(m)) if m > 1.0 && r < m * 0.5 => Color::Red,
+        (Some(r), Some(m)) if m > 1.0 && r < m * 0.7 => Color::Yellow,
+        _ => Color::White,
+    };
+    lines.push(dsl_row(
+        "Data rate",
+        snap.rate_down_mbps.map(|v| (fmt_opt_mbps(Some(v)), rate_down_color)).unwrap_or_else(|| dash.clone()),
+        snap.rate_up_mbps.map(|v| (fmt_opt_mbps(Some(v)), rate_up_color)).unwrap_or_else(|| dash.clone()),
+    ));
+    lines.push(dsl_row(
+        "Max rate",
+        snap.max_rate_down_mbps.map(|v| (fmt_opt_mbps(Some(v)), Color::White)).unwrap_or_else(|| dash.clone()),
+        snap.max_rate_up_mbps.map(|v| (fmt_opt_mbps(Some(v)), Color::White)).unwrap_or_else(|| dash.clone()),
+    ));
+    lines.push(dsl_row(
+        "Power",
+        snap.power_down_dbm.map(|v| (fmt_opt_dbm(Some(v)), Color::Gray)).unwrap_or_else(|| dash.clone()),
+        snap.power_up_dbm.map(|v| (fmt_opt_dbm(Some(v)), Color::Gray)).unwrap_or_else(|| dash.clone()),
+    ));
+
+    lines.push(Line::from(""));
+    if let Some(state) = &snap.state {
+        let color = if state.eq_ignore_ascii_case("connected") { Color::Green } else { Color::Yellow };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {:<18}", "State"), Style::default().fg(Color::DarkGray)),
+            Span::styled(state.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        ]));
+    }
+    if let Some(mode) = &snap.mode {
+        lines.push(dsl_shared_row("Line mode", mode));
+    }
+    if snap.uptime_secs.is_some() || snap.state.is_some() {
+        lines.push(dsl_shared_row("Connection uptime", &fmt_uptime(snap.uptime_secs)));
+    }
+    lines.push(dsl_shared_row(
+        "CRC errors",
+        &snap.crc_errors.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+    ));
+    lines.push(dsl_shared_row(
+        "Wireless clients",
+        &snap.wireless_clients.map(|w| w.to_string()).unwrap_or_else(|| "-".into()),
+    ));
+    if let Some(fw) = &snap.firmware {
+        lines.push(dsl_shared_row("Firmware", fw));
+    }
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_modem_log(f: &mut Frame, app: &mut App, area: Rect) {
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            format!(" MODEM LOG ({} events) ", app.dsl.incidents.len()),
+            Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.dsl.incidents.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "no abnormal values detected - SNR drops, attenuation spikes, CRC growth and reconnections will be logged here",
+                Style::default().fg(Color::DarkGray),
+            ))
+            .alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
+
+    let visible = inner.height as usize;
+    let start = app.dsl.incidents.len().saturating_sub(visible);
+    let lines: Vec<Line> = app.dsl.incidents[start..]
+        .iter()
+        .rev()
+        .map(|i: &crate::dsl::ModemIncident| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {} ", i.at.format("%H:%M:%S")),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!(" {} ", i.severity.label()),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(i.severity.color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}: ", i.field),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}", i.observed),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::styled(
+                    format!("  (expected: {})", i.expected),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_modem_editor(f: &mut Frame, app: &App, area: Rect) {
+    let w = 66.min(area.width.saturating_sub(4));
+    let h = 9;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect { x, y, width: w, height: h };
+
+    f.render_widget(ratatui::widgets::Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(
+            " MODEM CONNECTION (TR-064) ",
+            Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(Color::Rgb(25, 25, 40)));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let cursor = if app.spinner_frame % 2 == 0 { "_" } else { " " };
+    let fields: [(&str, String, bool); 3] = [
+        ("address", app.dsl.buf_addr.clone(), false),
+        ("username", app.dsl.buf_user.clone(), false),
+        ("password", "*".repeat(app.dsl.buf_pass.chars().count()), true),
+    ];
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (label, value, masked)) in fields.iter().enumerate() {
+        let active = i == app.dsl.edit_field;
+        let marker = if active { "> " } else { "  " };
+        let shown: String = value
+            .chars()
+            .take(inner.width.saturating_sub(14) as usize)
+            .collect();
+        lines.push(Line::from(vec![
+            Span::styled(marker, Style::default().fg(if active { Color::Cyan } else { Color::DarkGray })),
+            Span::styled(
+                format!("{:<10}", label),
+                Style::default().fg(if active { Color::Cyan } else { Color::DarkGray }),
+            ),
+            Span::styled(
+                if *masked { shown } else { format!("{shown}{cursor}") },
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " UP/DOWN field · ENTER apply · ESC cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), Rect { x: inner.x + 1, y: inner.y + 1, width: inner.width.saturating_sub(2), height: inner.height.saturating_sub(2), ..inner });
+}
+
 fn draw_history(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -1219,6 +1591,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         keys::Scope::Global,
         keys::Scope::Test,
         keys::Scope::Monitor,
+        keys::Scope::Dsl,
         keys::Scope::History,
     ] {
         text.push(Line::from(Span::styled(
@@ -1273,6 +1646,10 @@ fn draw_help(f: &mut Frame, area: Rect) {
         "message instead of hanging.",
         "The shortcut bar scrolls by itself when there is not enough room",
         "for every entry on screen.",
+        "Modem statistics (SNR, attenuation, rates) come from the modem's",
+        "TR-064 management API on your LAN - they only exist on modems, so",
+        "other connection types show an explanatory notice instead. Set the",
+        "address with F7 on the Modem tab (default fritz.box).",
     ] {
         text.push(Line::from(Span::styled(
             format!(" {note}"),
@@ -1319,10 +1696,105 @@ fn grade_span(grade: char, range: &str, color: Color) -> Span<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::{Terminal};
     use ratatui::style::{Color, Style};
 
     fn span(s: &str) -> Span<'static> {
         Span::styled(s.to_string(), Style::default().fg(Color::Cyan))
+    }
+
+    /// Render one frame at a comfortable size and return the visible text.
+    fn render(app: &mut App) -> String {
+        let backend = TestBackend::new(110, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let mut s = String::new();
+        for cell in terminal.backend().buffer().content.iter() {
+            s.push_str(cell.symbol());
+        }
+        s
+    }
+
+    #[test]
+    fn dsl_tab_shows_modem_only_notice_when_unavailable() {
+        let mut app = App::new();
+        app.tab = crate::app::Tab::Dsl;
+        app.dsl.polling = true;
+        app.dsl.current = Some(crate::dsl::DslSnapshot {
+            available: false,
+            unavailable_reason: Some("connection refused".into()),
+            ..Default::default()
+        });
+
+        let screen = render(&mut app);
+        assert!(
+            screen.contains("MODEM STATS REQUIRE A TR-064"),
+            "banner missing"
+        );
+        assert!(screen.contains("FRITZ!BOX"), "technology hint missing");
+        assert!(screen.contains("connection refused"), "reason missing");
+    }
+
+    #[test]
+    fn dsl_tab_renders_downstream_upstream_grid_when_available() {
+        let mut app = App::new();
+        app.tab = crate::app::Tab::Dsl;
+        app.dsl.current = Some(crate::dsl::DslSnapshot {
+            available: true,
+            state: Some("Connected".into()),
+            uptime_secs: Some(90000), // 1d 1h
+            snr_down_db: Some(8.7),
+            snr_up_db: Some(6.2),
+            atten_down_db: Some(21.3),
+            atten_up_db: Some(12.1),
+            rate_down_mbps: Some(103.2),
+            rate_up_mbps: Some(32.1),
+            max_rate_down_mbps: Some(118.7),
+            max_rate_up_mbps: Some(38.5),
+            crc_errors: Some(42),
+            wireless_clients: Some(3),
+            ..Default::default()
+        });
+
+        let screen = render(&mut app);
+        assert!(screen.contains("LINE STATISTICS"));
+        assert!(screen.contains("DOWNSTREAM"));
+        assert!(screen.contains("UPSTREAM"));
+        assert!(screen.contains("SNR margin"));
+        assert!(screen.contains("8.7 dB"));
+        assert!(screen.contains("21.3 dB"));
+        assert!(screen.contains("103.20 Mbps"));
+        assert!(screen.contains("118.70 Mbps"));
+        assert!(screen.contains("Connected"));
+        assert!(screen.contains("1d 1h"));
+        assert!(screen.contains("Wireless clients"));
+    }
+
+    #[test]
+    fn dsl_tab_lists_incidents_with_time_value_and_expected_range() {
+        let mut app = App::new();
+        app.tab = crate::app::Tab::Dsl;
+        app.dsl.current = Some(crate::dsl::DslSnapshot {
+            available: true,
+            snr_down_db: Some(2.4),
+            ..Default::default()
+        });
+        app.dsl.incidents.push(crate::dsl::ModemIncident {
+            at: chrono::Local::now(),
+            severity: crate::dsl::Severity::Critical,
+            field: "SNR margin downstream",
+            observed: "2.4 dB".into(),
+            expected: crate::dsl::SNR_EXPECTED.into(),
+        });
+
+        let screen = render(&mut app);
+        assert!(screen.contains("MODEM LOG"));
+        assert!(screen.contains("CRIT"), "severity badge missing");
+        assert!(screen.contains("SNR margin downstream"));
+        assert!(screen.contains("2.4 dB"));
+        assert!(screen.contains("(expected: >= 6 dB (critical below 3))"));
     }
 
     #[test]

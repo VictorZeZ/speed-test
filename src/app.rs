@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
+use crate::dsl;
+
 const ERROR_VISIBLE_SECS: u64 = 15;
 /// A healthy run emits events at least every ~250 ms in every phase. If
 /// nothing arrives for this long, the connection or server is stuck — abort
@@ -22,12 +24,13 @@ const MAX_THROUGHPUT_SAMPLES: usize = 600;
 pub enum Tab {
     Test,
     Monitor,
+    Dsl,
     History,
     Help,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Test, Tab::Monitor, Tab::History, Tab::Help];
+    pub const ALL: [Tab; 5] = [Tab::Test, Tab::Monitor, Tab::Dsl, Tab::History, Tab::Help];
 
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
@@ -364,6 +367,315 @@ impl MonitorState {
     }
 }
 
+// ---------- Modem (DSL) monitoring ----------
+
+/// Maximum modem log entries kept (newest appended at the end).
+const MAX_MODEM_LOG: usize = 80;
+
+pub struct DslState {
+    pub polling: bool,
+    pub paused: bool,
+    pub current: Option<dsl::DslSnapshot>,
+    pub incidents: Vec<dsl::ModemIncident>,
+    pub config: dsl::ModemConfig,
+
+    // editor popup
+    pub editing: bool,
+    pub edit_field: usize, // 0 = address, 1 = user, 2 = password
+    pub buf_addr: String,
+    pub buf_user: String,
+    pub buf_pass: String,
+
+    cancel: Option<Arc<AtomicBool>>,
+    pub rx: Option<UnboundedReceiver<dsl::DslEvent>>,
+
+    // anomaly tracking between snapshots
+    prev_uptime: Option<u64>,
+    prev_crc: Option<u64>,
+    prev_wireless: Option<u32>,
+    snr_alert_down: u8,
+    snr_alert_up: u8,
+    att_alert_down: u8,
+    att_alert_up: u8,
+    rate_alert_down: bool,
+    rate_alert_up: bool,
+}
+
+impl DslState {
+    fn new() -> Self {
+        Self {
+            polling: false,
+            paused: false,
+            current: None,
+            incidents: Vec::new(),
+            config: dsl::ModemConfig::default(),
+            editing: false,
+            edit_field: 0,
+            buf_addr: String::new(),
+            buf_user: String::new(),
+            buf_pass: String::new(),
+            cancel: None,
+            rx: None,
+            prev_uptime: None,
+            prev_crc: None,
+            prev_wireless: None,
+            snr_alert_down: 0,
+            snr_alert_up: 0,
+            att_alert_down: 0,
+            att_alert_up: 0,
+            rate_alert_down: false,
+            rate_alert_up: false,
+        }
+    }
+
+    fn push_incident(
+        &mut self,
+        severity: dsl::Severity,
+        field: &'static str,
+        observed: impl Into<String>,
+        expected: &str,
+    ) {
+        self.incidents.push(dsl::ModemIncident {
+            at: Local::now(),
+            severity,
+            field,
+            observed: observed.into(),
+            expected: expected.to_string(),
+        });
+        if self.incidents.len() > MAX_MODEM_LOG {
+            self.incidents.remove(0);
+        }
+    }
+
+    /// Feed one snapshot and derive abnormal-value incidents from the delta
+    /// against the previous snapshot. Level-based alerts fire once on entry
+    /// and once on recovery instead of spamming every poll.
+    fn on_snapshot(&mut self, snap: dsl::DslSnapshot) {
+        if !snap.available {
+            self.current = Some(snap);
+            return;
+        }
+
+        // Connection uptime reset => line reconnect.
+        if let Some(up) = snap.uptime_secs {
+            if let Some(prev) = self.prev_uptime {
+                if up + 5 < prev && prev >= 60 {
+                    self.push_incident(
+                        dsl::Severity::Warning,
+                        "Connection uptime",
+                        format!("reconnected - reset to {}s after {}s", up, prev),
+                        "monotonically increasing while connected",
+                    );
+                }
+            }
+            self.prev_uptime = Some(up);
+        }
+
+        // CRC error growth.
+        if let Some(crc) = snap.crc_errors {
+            if let Some(prev) = self.prev_crc {
+                if crc > prev {
+                    let delta = crc - prev;
+                    let severity = if delta >= 100 {
+                        dsl::Severity::Critical
+                    } else if delta >= 10 {
+                        dsl::Severity::Warning
+                    } else {
+                        dsl::Severity::Info
+                    };
+                    self.push_incident(
+                        severity,
+                        "CRC errors",
+                        format!("+{} in ~2s (total {})", delta, crc),
+                        "no growth over time",
+                    );
+                }
+            }
+            self.prev_crc = Some(crc);
+        }
+
+        // Wireless client changes.
+        if let Some(w) = snap.wireless_clients {
+            if let Some(prev) = self.prev_wireless {
+                if w != prev {
+                    self.push_incident(
+                        dsl::Severity::Info,
+                        "Wireless clients",
+                        format!("{} -> {}", prev, w),
+                        "changes are informational",
+                    );
+                }
+            }
+            self.prev_wireless = Some(w);
+        }
+
+        // SNR margins per direction.
+        let snr_checks = [
+            ("SNR margin downstream", snap.snr_down_db, &mut self.snr_alert_down),
+            ("SNR margin upstream", snap.snr_up_db, &mut self.snr_alert_up),
+        ];
+        for (field, value, state) in snr_checks {
+            check_level(&mut self.incidents, field, value, state,
+                dsl::SNR_WARN_DB, dsl::SNR_CRIT_DB,
+                |v| format!("{:.1} dB", v),
+                dsl::SNR_EXPECTED);
+        }
+
+        // Attenuation per direction (higher is worse).
+        let att_checks = [
+            ("Line attenuation downstream", snap.atten_down_db, &mut self.att_alert_down),
+            ("Line attenuation upstream", snap.atten_up_db, &mut self.att_alert_up),
+        ];
+        for (field, value, state) in att_checks {
+            check_high_level(&mut self.incidents, field, value, state,
+                dsl::ATT_WARN_DB, dsl::ATT_CRIT_DB,
+                |v| format!("{:.1} dB", v),
+                dsl::ATT_EXPECTED);
+        }
+
+        // Data rate collapse vs max rate.
+        rate_collapse_check(
+            &mut self.incidents,
+            "Data rate downstream",
+            snap.rate_down_mbps,
+            snap.max_rate_down_mbps,
+            &mut self.rate_alert_down,
+        );
+        rate_collapse_check(
+            &mut self.incidents,
+            "Data rate upstream",
+            snap.rate_up_mbps,
+            snap.max_rate_up_mbps,
+            &mut self.rate_alert_up,
+        );
+
+        self.current = Some(snap);
+    }
+}
+
+/// Shared logic for values where lower-is-bad below warn/crit thresholds.
+fn check_level(
+    incidents: &mut Vec<dsl::ModemIncident>,
+    field: &'static str,
+    value: Option<f64>,
+    state: &mut u8,
+    warn_below: f64,
+    crit_below: f64,
+    fmt: impl Fn(f64) -> String,
+    expected: &'static str,
+) {
+    let Some(v) = value else { return };
+    let level = if v < crit_below {
+        2
+    } else if v < warn_below {
+        1
+    } else {
+        0
+    };
+    if level > *state && level > 0 {
+        let sev = if level == 2 { dsl::Severity::Critical } else { dsl::Severity::Warning };
+        incidents.push(dsl::ModemIncident {
+            at: Local::now(),
+            severity: sev,
+            field,
+            observed: fmt(v),
+            expected: expected.to_string(),
+        });
+        if incidents.len() > MAX_MODEM_LOG {
+            incidents.remove(0);
+        }
+        *state = level;
+    } else if level == 0 && *state > 0 {
+        incidents.push(dsl::ModemIncident {
+            at: Local::now(),
+            severity: dsl::Severity::Info,
+            field,
+            observed: format!("recovered to {:.1}", v),
+            expected: expected.to_string(),
+        });
+        if incidents.len() > MAX_MODEM_LOG {
+            incidents.remove(0);
+        }
+        *state = 0;
+    }
+}
+
+/// Inverse of `check_level` for values where higher-is-bad.
+fn check_high_level(
+    incidents: &mut Vec<dsl::ModemIncident>,
+    field: &'static str,
+    value: Option<f64>,
+    state: &mut u8,
+    warn_above: f64,
+    crit_above: f64,
+    fmt: impl Fn(f64) -> String,
+    expected: &'static str,
+) {
+    let Some(v) = value else { return };
+    let level = if v > crit_above {
+        2
+    } else if v > warn_above {
+        1
+    } else {
+        0
+    };
+    if level > *state && level > 0 {
+        let sev = if level == 2 { dsl::Severity::Critical } else { dsl::Severity::Warning };
+        incidents.push(dsl::ModemIncident {
+            at: Local::now(),
+            severity: sev,
+            field,
+            observed: fmt(v),
+            expected: expected.to_string(),
+        });
+        if incidents.len() > MAX_MODEM_LOG {
+            incidents.remove(0);
+        }
+        *state = level;
+    } else if level == 0 && *state > 0 {
+        incidents.push(dsl::ModemIncident {
+            at: Local::now(),
+            severity: dsl::Severity::Info,
+            field,
+            observed: format!("recovered to {:.1}", v),
+            expected: expected.to_string(),
+        });
+        if incidents.len() > MAX_MODEM_LOG {
+            incidents.remove(0);
+        }
+        *state = 0;
+    }
+}
+
+fn rate_collapse_check(
+    incidents: &mut Vec<dsl::ModemIncident>,
+    field: &'static str,
+    rate: Option<f64>,
+    max: Option<f64>,
+    alert_active: &mut bool,
+) {
+    let (Some(rate), Some(max)) = (rate, max) else { return };
+    if max <= 1.0 {
+        return; // max rate not meaningful yet
+    }
+    let collapsed = rate < max * dsl::RATE_MIN_FRAC;
+    if collapsed && !*alert_active {
+        incidents.push(dsl::ModemIncident {
+            at: Local::now(),
+            severity: dsl::Severity::Warning,
+            field,
+            observed: format!("{:.2} Mbps of {:.2} Mbps max", rate, max),
+            expected: dsl::RATE_EXPECTED.to_string(),
+        });
+        if incidents.len() > MAX_MODEM_LOG {
+            incidents.remove(0);
+        }
+        *alert_active = true;
+    } else if !collapsed && *alert_active && rate >= max * 0.7 {
+        *alert_active = false;
+    }
+}
+
 // ---------- App ----------
 
 pub struct App {
@@ -398,6 +710,7 @@ pub struct App {
 
     pub spinner_frame: usize,
     pub monitor: MonitorState,
+    pub dsl: DslState,
 
     test_tx: Option<UnboundedReceiver<TestEvent>>,
     cancel_flag: Option<Arc<AtomicBool>>,
@@ -452,6 +765,7 @@ impl App {
             metrics: None,
             spinner_frame: 0,
             monitor: MonitorState::new(),
+            dsl: DslState::new(),
             test_tx: None,
             cancel_flag: None,
             pending_meta: None,
@@ -680,6 +994,41 @@ impl App {
         self.monitor.stable_since = Instant::now();
     }
 
+    // ----- modem (DSL) -----
+
+    /// Starts the background TR-064 poller. Safe to call again after a config
+    /// change; replaces any previous poller.
+    pub fn begin_dsl_polling(&mut self) {
+        if let Some(flag) = &self.dsl.cancel {
+            flag.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = unbounded_channel();
+        self.dsl.cancel = Some(cancel.clone());
+        self.dsl.rx = Some(rx);
+        self.dsl.polling = true;
+
+        let config = dsl::ModemConfig {
+            host: self.dsl.config.host.clone(),
+            username: self.dsl.config.username.clone(),
+            password: self.dsl.config.password.clone(),
+        };
+        tokio::spawn(dsl::run_modem_poller(config, cancel, tx));
+    }
+
+    pub fn stop_dsl_polling(&mut self) {
+        if let Some(flag) = &self.dsl.cancel {
+            flag.store(true, Ordering::Relaxed);
+        }
+        self.dsl.cancel = None;
+        self.dsl.rx = None;
+        self.dsl.polling = false;
+    }
+
+    pub fn clear_modem_log(&mut self) {
+        self.dsl.incidents.clear();
+    }
+
     // ----- main tick -----
 
     pub fn tick(&mut self) {
@@ -702,6 +1051,21 @@ impl App {
             }
             for s in samples {
                 self.monitor.on_sample(s);
+            }
+        }
+
+        // Modem statistics polling (independent of everything else).
+        if !self.dsl.paused {
+            if let Some(rx) = self.dsl.rx.as_mut() {
+                let mut snaps: Vec<dsl::DslSnapshot> = Vec::new();
+                while let Ok(ev) = rx.try_recv() {
+                    let dsl::DslEvent::Snapshot(snap) = ev;
+                    snaps.push(snap);
+                }
+                // Keep only the newest snapshot; incidents derive from it.
+                if let Some(latest) = snaps.pop() {
+                    self.dsl.on_snapshot(latest);
+                }
             }
         }
 
@@ -892,8 +1256,14 @@ impl App {
         }
 
         // Target editor captures all input while open.
-        if self.tab == Tab::Monitor && self.monitor.editing_target {
-            self.handle_editor_key(key);
+        if (self.tab == Tab::Monitor && self.monitor.editing_target)
+            || (self.tab == Tab::Dsl && self.dsl.editing)
+        {
+            if self.tab == Tab::Monitor {
+                self.handle_editor_key(key);
+            } else {
+                self.handle_modem_edit_key(key);
+            }
             return;
         }
 
@@ -923,6 +1293,7 @@ impl App {
             Action::TabMonitor => self.tab = Tab::Monitor,
             Action::TabHistory => self.tab = Tab::History,
             Action::TabHelp => self.tab = Tab::Help,
+            Action::TabDsl => self.tab = Tab::Dsl,
 
             // ----- test tab -----
             Action::StartStopTest => match self.run_state {
@@ -975,6 +1346,25 @@ impl App {
                 }
             }
             Action::ResetSession => self.clear_monitor_session(),
+
+            // ----- modem tab -----
+            Action::DslPauseResume => {
+                if !self.dsl.polling {
+                    self.begin_dsl_polling();
+                } else {
+                    self.dsl.paused = !self.dsl.paused;
+                }
+            }
+            Action::EditModem => {
+                if !self.dsl.editing {
+                    self.dsl.editing = true;
+                    self.dsl.edit_field = 0;
+                    self.dsl.buf_addr = self.dsl.config.host.clone();
+                    self.dsl.buf_user = self.dsl.config.username.clone();
+                    self.dsl.buf_pass = self.dsl.config.password.clone();
+                }
+            }
+            Action::ClearModemLog => self.clear_modem_log(),
 
             // ----- history tab -----
             Action::HistoryUp => {
@@ -1042,6 +1432,63 @@ impl App {
         }
     }
 
+    /// Multi-field editor for the modem connection (address / user / password).
+    /// UP/DOWN switch fields; ENTER applies everything and restarts polling.
+    fn handle_modem_edit_key(&mut self, key: crossterm::event::KeyEvent) {
+        match keys::editor_key(&key) {
+            keys::EditorKey::Confirm => {
+                let addr = self.dsl.buf_addr.trim().to_string();
+                self.dsl.editing = false;
+                if !addr.is_empty() {
+                    self.dsl.config.host = addr;
+                    self.dsl.config.username = self.dsl.buf_user.trim().to_string();
+                    self.dsl.config.password = self.dsl.buf_pass.clone();
+                    // Restart with the new configuration.
+                    self.stop_dsl_polling();
+                    self.begin_dsl_polling();
+                }
+            }
+            keys::EditorKey::Cancel => {
+                self.dsl.editing = false;
+            }
+            keys::EditorKey::Backspace => {
+                match self.dsl.edit_field {
+                    0 => {
+                        self.dsl.buf_addr.pop();
+                    }
+                    1 => {
+                        self.dsl.buf_user.pop();
+                    }
+                    _ => {
+                        self.dsl.buf_pass.pop();
+                    }
+                };
+            }
+            keys::EditorKey::Char(c) => {
+                let buf = match self.dsl.edit_field {
+                    0 => &mut self.dsl.buf_addr,
+                    1 => &mut self.dsl.buf_user,
+                    _ => &mut self.dsl.buf_pass,
+                };
+                if buf.chars().count() < 128 {
+                    buf.push(c);
+                }
+            }
+            keys::EditorKey::Ignored => {}
+        }
+
+        // Field navigation via arrow keys.
+        match key.code {
+            crossterm::event::KeyCode::Up => {
+                self.dsl.edit_field = self.dsl.edit_field.saturating_sub(1);
+            }
+            crossterm::event::KeyCode::Down => {
+                self.dsl.edit_field = (self.dsl.edit_field + 1).min(2);
+            }
+            _ => {}
+        }
+    }
+
     // ----- test hooks -----
 
     /// Test-only: install a channel we control so the tick/event flow can be
@@ -1096,6 +1543,14 @@ mod tests {
                 jitter_ms: 2.0,
             },
         }
+    }
+
+    /// True when a failure is caused by the sandbox network rather than code
+    /// (used to skip network-dependent assertions gracefully).
+    fn env_blocked(msg: &str) -> bool {
+        ["no data", "could not connect", "timed out", "not responding", "stalled"]
+            .iter()
+            .any(|k| msg.contains(k))
     }
 
     fn temp_history_path() -> String {
@@ -1274,7 +1729,7 @@ mod tests {
                     let blocked = app
                         .error
                         .as_deref()
-                        .map(|e| e.contains("no data"))
+                        .map(env_blocked)
                         .unwrap_or(false);
                     if blocked {
                         eprintln!("SKIPPED: environment blocks test endpoints");
@@ -1306,7 +1761,7 @@ mod tests {
                     let blocked = app
                         .error
                         .as_deref()
-                        .map(|e| e.contains("no data"))
+                        .map(env_blocked)
                         .unwrap_or(false);
                     if blocked {
                         eprintln!(

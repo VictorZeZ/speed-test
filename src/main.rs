@@ -1,4 +1,5 @@
 mod app;
+mod dsl;
 mod history;
 #[cfg(windows)]
 mod input;
@@ -38,6 +39,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
     let mut app = App::new();
     app.load_history();
     app.begin_connection_lookup();
+    app.begin_dsl_polling();
 
     // Windows: read physical virtual-key codes so shortcuts work on every
     // keyboard language. Other platforms: crossterm's own event source.
